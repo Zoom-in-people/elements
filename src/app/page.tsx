@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { db } from "@/lib/firebase";
-import { ref, get, set, update, remove, onValue } from "firebase/database";
+import { ref, get, set, update, remove, onValue, onDisconnect } from "firebase/database";
 
 interface Card {
   id: number;
@@ -18,7 +18,6 @@ interface LeaderboardUser {
   totalScore: number;
 }
 
-// 학생 관리 및 로그인용 인터페이스
 interface UserAccount {
   id: string;
   username: string;
@@ -56,26 +55,44 @@ const CHEMICAL_POOL = [
   { id: "Cu", symbol: "Cu", name: "구리" }
 ];
 
+const ION_POOL = [
+  { id: "ion_H", symbol: "H⁺", name: "수소 이온" },
+  { id: "ion_Li", symbol: "Li⁺", name: "리튬 이온" },
+  { id: "ion_O", symbol: "O²⁻", name: "산화 이온" },
+  { id: "ion_F", symbol: "F⁻", name: "플루오린화 이온" },
+  { id: "ion_Na", symbol: "Na⁺", name: "나트륨 이온" },
+  { id: "ion_Mg", symbol: "Mg²⁺", name: "마그네슘 이온" },
+  { id: "ion_Al", symbol: "Al³⁺", name: "알루미늄 이온" },
+  { id: "ion_S", symbol: "S²⁻", name: "황화 이온" },
+  { id: "ion_Cl", symbol: "Cl⁻", name: "염화 이온" },
+  { id: "ion_K", symbol: "K⁺", name: "칼륨 이온" },
+  { id: "ion_Ca", symbol: "Ca²⁺", name: "칼슘 이온" },
+  { id: "ion_Br", symbol: "Br⁻", name: "브로민화 이온" },
+  { id: "ion_I", symbol: "I⁻", name: "아이오딘화 이온" },
+  { id: "ion_NO3", symbol: "NO₃⁻", name: "질산 이온" },
+  { id: "ion_MnO4", symbol: "MnO₄⁻", name: "과망가니즈산 이온" },
+  { id: "ion_Cu", symbol: "Cu²⁺", name: "구리 이온(2+)" }
+];
+
 export default function Home() {
-  // --- [인증 및 시스템 상태] ---
   const [gameStatus, setGameStatus] = useState<"login" | "signup" | "lobby" | "waiting" | "rps" | "playing" | "finished" | "admin">("login");
-  const [userId, setUserId] = useState(""); // 로그인한 사용자의 고유 ID (username과 동일하게 처리)
+  const [userId, setUserId] = useState(""); 
   const [nickname, setNickname] = useState("");
   const [myTotalScore, setMyTotalScore] = useState(0);
 
-  // --- [폼 입력 상태] ---
+  const [useElements, setUseElements] = useState(true);
+  const [useIons, setUseIons] = useState(true);
+
   const [formUsername, setFormUsername] = useState("");
   const [formPassword, setFormPassword] = useState("");
   const [formNickname, setFormNickname] = useState("");
   const [authError, setAuthError] = useState("");
 
-  // --- [교사 관리자 상태] ---
   const [studentList, setStudentList] = useState<UserAccount[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editNickname, setEditNickname] = useState("");
   const [editPassword, setEditPassword] = useState("");
 
-  // --- [게임 플레이 상태] ---
   const [roomId, setRoomId] = useState("");
   const [playerRole, setPlayerRole] = useState<"p1" | "p2" | null>(null);
   const [roomData, setRoomData] = useState<any>(null);
@@ -89,9 +106,41 @@ export default function Home() {
   const [scores, setScores] = useState({ p1: 0, p2: 0 });
   const [isLocked, setIsLocked] = useState(false);
 
-  // 실시간 리더보드 연동 (로그인 이후부터 상시 가동)
+  // 🛠️ [기능 3 반영] 구동 최초 진입 시, 자동 세션 로그인 처리 및 중간 튕김 재조인 검사
   useEffect(() => {
-    if (gameStatus === "login" || gameStatus === "signup" || gameStatus === "admin") return;
+    const initializeAuthAndGame = async () => {
+      const currentUserId = localStorage.getItem("element_game_user_id");
+      const savedRoomId = localStorage.getItem("element_game_room_id");
+
+      if (currentUserId) {
+        setUserId(currentUserId);
+        
+        if (savedRoomId) {
+          const roomSnap = await get(ref(db, `rooms/${savedRoomId}`));
+          if (roomSnap.exists()) {
+            const room = roomSnap.val();
+            // 활성화 상태이거나 끝나지 않은 방이면 즉각 해당 상태로 바인딩 전환
+            if ((room.p1 === currentUserId || room.p2 === currentUserId) && room.status !== "finished") {
+              setRoomId(savedRoomId);
+              setPlayerRole(room.p1 === currentUserId ? "p1" : "p2");
+              setGameStatus(room.status);
+              return;
+            }
+          }
+          localStorage.removeItem("element_game_room_id");
+        }
+        setGameStatus("lobby");
+      } else {
+        setGameStatus("login");
+      }
+    };
+
+    initializeAuthAndGame();
+  }, []);
+
+  // 상시 가동되는 데이터베이스 바인딩 리스너
+  useEffect(() => {
+    if (!userId) return;
 
     const allUsersRef = ref(db, "users");
     const unsubscribe = onValue(allUsersRef, (snapshot) => {
@@ -107,7 +156,6 @@ export default function Home() {
       }
     });
 
-    // 내 점수 실시간 연동
     const myUserRef = ref(db, `users/${userId}`);
     const myUnsubscribe = onValue(myUserRef, (snapshot) => {
       if (snapshot.exists()) {
@@ -120,12 +168,10 @@ export default function Home() {
       unsubscribe();
       myUnsubscribe();
     };
-  }, [gameStatus, userId]);
+  }, [userId]);
 
-  // 교사 페이지 진입 시 학생 목록 실시간 구독
   useEffect(() => {
     if (gameStatus !== "admin") return;
-
     const allUsersRef = ref(db, "users");
     const unsubscribe = onValue(allUsersRef, (snapshot) => {
       if (snapshot.exists()) {
@@ -142,7 +188,6 @@ export default function Home() {
         setStudentList([]);
       }
     });
-
     return () => unsubscribe();
   }, [gameStatus]);
 
@@ -173,7 +218,6 @@ export default function Home() {
     }
   }, [gameStatus]);
 
-  // --- [회원가입 처리] ---
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
@@ -181,60 +225,51 @@ export default function Home() {
       setAuthError("모든 칸을 입력해 주세요.");
       return;
     }
-
     if (formUsername === "admin") {
       setAuthError("사용할 수 없는 아이디입니다.");
       return;
     }
-
     const userRef = ref(db, `users/${formUsername}`);
     const snapshot = await get(userRef);
     if (snapshot.exists()) {
       setAuthError("이미 존재하는 아이디입니다.");
       return;
     }
-
     await set(userRef, {
       username: formUsername,
       password: formPassword,
       nickname: formNickname,
       totalScore: 0
     });
-
     alert("회원가입이 완료되었습니다! 로그인해 주세요.");
     setGameStatus("login");
     setFormNickname("");
     setFormPassword("");
   };
 
-  // --- [로그인 처리] ---
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
-
-    // 교사용 계정 예외 처리
     if (formUsername === "admin" && formPassword === "teacherpw") {
       setGameStatus("admin");
       setFormUsername("");
       setFormPassword("");
       return;
     }
-
     const userRef = ref(db, `users/${formUsername}`);
     const snapshot = await get(userRef);
-
     if (!snapshot.exists()) {
       setAuthError("존재하지 않는 아이디입니다.");
       return;
     }
-
     const userData = snapshot.val();
     if (userData.password !== formPassword) {
       setAuthError("비밀번호가 일치하지 않습니다.");
       return;
     }
-
-    // 로그인 성공 시 정보 세팅 후 로비 진입
+    
+    // 세션 기록 유지 보장
+    localStorage.setItem("element_game_user_id", formUsername);
     setUserId(formUsername);
     setNickname(userData.nickname);
     setMyTotalScore(userData.totalScore || 0);
@@ -243,7 +278,6 @@ export default function Home() {
     setFormPassword("");
   };
 
-  // --- [교사 기능: 학생 수정 저장] ---
   const saveStudentEdit = async (id: string) => {
     if (!editNickname || !editPassword) {
       alert("공백으로 수정할 수 없습니다.");
@@ -256,15 +290,17 @@ export default function Home() {
     setEditingId(null);
   };
 
-  // --- [교사 기능: 학생 삭제] ---
   const deleteStudent = async (id: string) => {
     if (confirm(`정말로 이 학생(${id}) 계정을 삭제하시겠습니까?\n누적 점수도 함께 사라집니다.`)) {
       await remove(ref(db, `users/${id}`));
     }
   };
 
-  // --- [게임 플레이 방 참가/생성 로직] ---
   const joinGame = async () => {
+    if (!useElements && !useIons) {
+      alert("원소기호와 이온 중 최소 하나는 선택해야 합니다.");
+      return;
+    }
     setGameStatus("waiting");
     const roomsRef = ref(db, "rooms");
     const snapshot = await get(roomsRef);
@@ -273,12 +309,26 @@ export default function Home() {
     if (snapshot.exists()) {
       const rooms = snapshot.val();
       for (const key in rooms) {
-        if (rooms[key].status === "waiting") {
-          const shuffledPool = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5);
-          const selectedElements = shuffledPool.slice(0, 15);
+        if (rooms[key].status === "waiting" && 
+            rooms[key].mode?.elements === useElements && 
+            rooms[key].mode?.ions === useIons) {
+          
+          let selectedPairs: any[] = [];
+          
+          if (useElements && !useIons) {
+            const shuffled = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5);
+            selectedPairs = shuffled.slice(0, 10);
+          } else if (!useElements && useIons) {
+            const shuffled = [...ION_POOL].sort(() => Math.random() - 0.5);
+            selectedPairs = shuffled.slice(0, 10);
+          } else {
+            const shuffledElements = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5);
+            const shuffledIons = [...ION_POOL].sort(() => Math.random() - 0.5);
+            selectedPairs = [...shuffledElements.slice(0, 5), ...shuffledIons.slice(0, 5)];
+          }
           
           const rawData: any[] = [];
-          selectedElements.forEach((elem) => {
+          selectedPairs.forEach((elem) => {
             rawData.push({ pairId: elem.id, content: elem.symbol, isFlipped: false, matchedBy: null });
             rawData.push({ pairId: elem.id, content: elem.name, isFlipped: false, matchedBy: null });
           });
@@ -294,6 +344,8 @@ export default function Home() {
             p1_rps: null,
             p2_rps: null
           });
+          
+          localStorage.setItem("element_game_room_id", key);
           setRoomId(key);
           setPlayerRole("p2");
           joined = true;
@@ -304,16 +356,43 @@ export default function Home() {
 
     if (!joined) {
       const newRoomId = `room_${Date.now()}`;
-      await set(ref(db, `rooms/${newRoomId}`), {
+      const newRoomRef = ref(db, `rooms/${newRoomId}`);
+      await set(newRoomRef, {
         p1: userId,
-        status: "waiting"
+        status: "waiting",
+        mode: { elements: useElements, ions: useIons }
       });
+      
+      localStorage.setItem("element_game_room_id", newRoomId);
+      
+      // 🛠️ [기능 2 반영] 대기방 생성 후 매칭되기 전에 방장이 나가면(새로고침/종료) 방을 파기 예약
+      onDisconnect(newRoomRef).remove();
+
       setRoomId(newRoomId);
       setPlayerRole("p1");
     }
   };
 
-  // 실시간 방 데이터 수신
+  // 🛠️ [기능 1 반영] 매칭 대기 중인 유저가 수동으로 취소 요청 시 파기 함수
+  const cancelMatching = async () => {
+    if (!roomId) return;
+    setIsLocked(true);
+    try {
+      const roomRef = ref(db, `rooms/${roomId}`);
+      await onDisconnect(roomRef).cancel(); // 비정상 예약 철회
+      await remove(roomRef); // 실시간 방 데이터 폭파
+      
+      localStorage.removeItem("element_game_room_id");
+      setRoomId("");
+      setPlayerRole(null);
+      setGameStatus("lobby");
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLocked(false);
+    }
+  };
+
   useEffect(() => {
     if (!roomId) return;
     const roomRef = ref(db, `rooms/${roomId}`);
@@ -326,12 +405,16 @@ export default function Home() {
         if (data.currentTurn) setCurrentTurn(data.currentTurn);
         if (data.scores) setScores(data.scores);
         if (data.comboCount !== undefined) setComboCount(data.comboCount);
+
+        // 🛠️ [기능 2 반영] 매칭이 체결되어 rps나 playing단계로 격상하면 창닫기 시 방 강제폭파 예약을 완전 철회
+        if (playerRole === "p1" && data.status !== "waiting") {
+          onDisconnect(roomRef).cancel();
+        }
       }
     });
     return () => unsubscribe();
-  }, [roomId]);
+  }, [roomId, playerRole]);
 
-  // 가위바위보 판정
   useEffect(() => {
     if (gameStatus === "rps" && playerRole === "p1" && roomData?.p1_rps && roomData?.p2_rps) {
       const p1 = roomData.p1_rps;
@@ -351,16 +434,14 @@ export default function Home() {
     }
   }, [gameStatus, playerRole, roomData?.p1_rps, roomData?.p2_rps, roomId]);
 
-  // 판 끝남 판정
   useEffect(() => {
-    if (gameStatus === "playing" && scores.p1 + scores.p2 === 15) {
+    if (gameStatus === "playing" && scores.p1 + scores.p2 === 10) {
       if (playerRole === "p1") {
         update(ref(db, `rooms/${roomId}`), { status: "finished" });
       }
     }
   }, [scores, gameStatus, playerRole, roomId]);
 
-  // 점수 정산
   useEffect(() => {
     if (gameStatus === "finished" && playerRole) {
       const myScore = scores[playerRole];
@@ -368,8 +449,8 @@ export default function Home() {
       let earnedPoints = 0;
       
       if (myScore > opScore) earnedPoints = 3;
-      else if (myScore === opScore) earnedPoints = 1;
-      else earnedPoints = 1; // 🔥 패배 시에도 +1점 부여!
+      else if (myScore === opScore) earnedPoints = 2; 
+      else earnedPoints = 1; 
 
       get(ref(db, `users/${userId}/totalScore`)).then((snap) => {
         const currentScore = snap.val() || 0;
@@ -428,7 +509,24 @@ export default function Home() {
     }
   };
 
+  const getEmoji = (choice: string) => {
+    if (choice === "rock") return "✊";
+    if (choice === "paper") return "🖐️";
+    if (choice === "scissors") return "✌️";
+    return "🤔";
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("element_game_user_id");
+    localStorage.removeItem("element_game_room_id");
+    setUserId("");
+    setNickname("");
+    setMyTotalScore(0);
+    setGameStatus("login");
+  };
+
   const leaveRoom = () => {
+    localStorage.removeItem("element_game_room_id"); // 경기 종료 후 세션 파기
     setGameStatus("lobby");
     setRoomId("");
     setPlayerRole(null);
@@ -438,13 +536,6 @@ export default function Home() {
     setComboCount(0);
     setCurrentTurn("p1");
     setPreviewStatus("none");
-  };
-  // 가위바위보 이모지 변환 도우미 (이 부분을 return 위에 추가해 주세요!)
-  const getEmoji = (choice: string) => {
-    if (choice === "rock") return "✊";
-    if (choice === "paper") return "🖐️";
-    if (choice === "scissors") return "✌️";
-    return "🤔";
   };
 
   return (
@@ -500,7 +591,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* 3️⃣ 교사 전용 관리 화면 (admin) */}
+      {/* 3️⃣ 교사 전용 관리 화면 */}
       {gameStatus === "admin" && (
         <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-4xl border-t-8 border-purple-600">
           <div className="flex justify-between items-center mb-6">
@@ -510,7 +601,6 @@ export default function Home() {
             </div>
             <button onClick={() => setGameStatus("login")} className="px-4 py-2 bg-slate-600 hover:bg-slate-700 text-white font-bold rounded-xl shadow-sm text-sm">관리자 로그아웃</button>
           </div>
-
           <div className="overflow-x-auto border rounded-xl">
             <table className="w-full text-left border-collapse text-black text-sm">
               <thead>
@@ -556,30 +646,40 @@ export default function Home() {
                     </td>
                   </tr>
                 ))}
-                {studentList.length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="p-8 text-center text-gray-400 font-bold">등록된 학생 계정이 아직 없습니다.</td>
-                  </tr>
-                )}
               </tbody>
             </table>
           </div>
         </div>
       )}
 
-      {/* 🟢 로비 화면 */}
+      {/* 4️⃣ 로비 화면 */}
       {gameStatus === "lobby" && (
         <div className="flex flex-col md:flex-row gap-6 w-full max-w-4xl">
           <div className="flex-1 bg-white p-8 rounded-2xl shadow-xl text-center border-t-8 border-blue-500 flex flex-col justify-between">
             <div className="text-right">
-              <button onClick={() => setGameStatus("login")} className="text-xs font-bold text-gray-400 hover:text-red-500 hover:underline">로그아웃</button>
+              <button onClick={handleLogout} className="text-xs font-bold text-gray-400 hover:text-red-500 hover:underline">로그아웃</button>
             </div>
             <div className="mt-2">
               <h1 className="text-4xl font-black mb-2 text-slate-800">🧪 원소 기호 대전</h1>
-              <p className="text-gray-400 mb-6">로그인 계정: <span className="text-slate-700 font-bold">{nickname} ({userId})</span></p>
-              <div className="bg-blue-50 p-6 rounded-xl mb-6">
+              <p className="text-gray-400 mb-6">연구원 정보: <span className="text-slate-700 font-bold">{nickname} ({userId})</span></p>
+              
+              <div className="bg-slate-50 p-4 rounded-xl mb-4 border border-gray-200 text-black text-left">
+                <div className="text-xs font-bold text-gray-400 mb-2">게임 출제 범위 설정</div>
+                <div className="flex gap-6 justify-center py-2">
+                  <label className="flex items-center gap-2 font-bold cursor-pointer text-lg">
+                    <input type="checkbox" checked={useElements} onChange={(e) => setUseElements(e.target.checked)} className="w-5 h-5 accent-blue-600" />
+                    원소기호 (1~20번+필수6종)
+                  </label>
+                  <label className="flex items-center gap-2 font-bold cursor-pointer text-lg">
+                    <input type="checkbox" checked={useIons} onChange={(e) => setUseIons(e.target.checked)} className="w-5 h-5 accent-blue-600" />
+                    이온세트 (필수16종)
+                  </label>
+                </div>
+              </div>
+
+              <div className="bg-blue-50 p-4 rounded-xl mb-6">
                 <div className="text-sm text-blue-500 font-bold mb-1">내 누적 승점</div>
-                <div className="text-5xl font-black text-blue-600">{myTotalScore}점</div>
+                <div className="text-4xl font-black text-blue-600">{myTotalScore}점</div>
               </div>
             </div>
             <button onClick={joinGame} className="w-full py-5 bg-blue-600 text-white text-2xl font-bold rounded-xl hover:bg-blue-700 shadow-md transition-all">
@@ -607,11 +707,19 @@ export default function Home() {
         </div>
       )}
 
-      {/* 🟡 대기 화면 */}
+      {/* 🟡 5️⃣ 대기 화면 */}
       {gameStatus === "waiting" && (
-        <div className="bg-white p-10 rounded-2xl shadow-xl text-center animate-pulse">
+        <div className="bg-white p-10 rounded-2xl shadow-xl text-center animate-pulse max-w-md w-full">
           <div className="text-6xl mb-4">👀</div>
-          <h2 className="text-2xl font-bold text-slate-700 mb-4">상대방을 기다리는 중입니다...</h2>
+          <h2 className="text-2xl font-bold text-slate-700 mb-4">동일 모드의 상대방을 매칭 중입니다...</h2>
+          
+          {/* 🛠️ [기능 1 반영] 취소 버튼 설계 */}
+          <button 
+            onClick={cancelMatching}
+            className="mt-6 px-6 py-2.5 bg-red-500 text-white font-bold rounded-xl hover:bg-red-600 shadow-sm transition-colors text-sm"
+          >
+            매칭 취소하고 로비로 돌아가기
+          </button>
         </div>
       )}
 
@@ -687,7 +795,7 @@ export default function Home() {
             </div>
           </div>
           
-          <div className="grid grid-cols-6 gap-2 sm:gap-3 max-w-3xl w-full mx-auto px-2">
+          <div className="grid grid-cols-5 gap-2 sm:gap-3 max-w-3xl w-full mx-auto px-2">
             {cards.map((card) => {
               const isShowing = previewStatus === "showAll" || card.isFlipped || card.matchedBy;
 
@@ -739,7 +847,7 @@ export default function Home() {
           <div className="text-3xl font-bold mb-8">
             {scores[playerRole!] > scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-blue-600">🎉 승리! (+3점)</span>}
             {scores[playerRole!] < scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-gray-500">패배... (+1점)</span>}
-            {scores[playerRole!] === scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-green-600">🤝 무승부! (+1점)</span>}
+            {scores[playerRole!] === scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-green-600">🤝 무승부! (+2점)</span>}
           </div>
           <button onClick={leaveRoom} className="px-8 py-4 bg-slate-800 text-white text-xl font-bold rounded-xl hover:bg-slate-900 shadow-md">
             로비로 돌아가기
