@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { db } from "@/lib/firebase";
 import { ref, get, set, update, remove, onValue, onDisconnect } from "firebase/database";
 
@@ -74,9 +74,12 @@ const ION_POOL = [
   { id: "ion_Cu", symbol: "Cu²⁺", name: "구리 이온(2+)" }
 ];
 
+// 상대방 이탈 후 대기 시간(ms) - 30초
+const DISCONNECT_TIMEOUT_MS = 30000;
+
 export default function Home() {
   const [gameStatus, setGameStatus] = useState<"login" | "signup" | "lobby" | "waiting" | "rps" | "playing" | "finished" | "admin">("login");
-  const [userId, setUserId] = useState(""); 
+  const [userId, setUserId] = useState("");
   const [nickname, setNickname] = useState("");
   const [myTotalScore, setMyTotalScore] = useState(0);
 
@@ -106,7 +109,19 @@ export default function Home() {
   const [scores, setScores] = useState({ p1: 0, p2: 0 });
   const [isLocked, setIsLocked] = useState(false);
 
-  // 🛠️ [기능 3 반영] 구동 최초 진입 시, 자동 세션 로그인 처리 및 중간 튕김 재조인 검사
+  // 🔧 추가: 상대방 이탈 감지 관련 상태
+  const [opponentDisconnected, setOpponentDisconnected] = useState(false);
+  const [disconnectCountdown, setDisconnectCountdown] = useState(0);
+  const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // 🔧 추가: 점수 중복 부여 방지 플래그
+  const scoreAppliedRef = useRef(false);
+
+  // 🔧 추가: 재입장 시 암기 타이머 중복 방지 플래그
+  const previewStartedRef = useRef(false);
+
+  // 최초 진입 시 세션 자동 로그인 & 중간 재조인
   useEffect(() => {
     const initializeAuthAndGame = async () => {
       const currentUserId = localStorage.getItem("element_game_user_id");
@@ -114,16 +129,22 @@ export default function Home() {
 
       if (currentUserId) {
         setUserId(currentUserId);
-        
+
         if (savedRoomId) {
           const roomSnap = await get(ref(db, `rooms/${savedRoomId}`));
           if (roomSnap.exists()) {
             const room = roomSnap.val();
-            // 활성화 상태이거나 끝나지 않은 방이면 즉각 해당 상태로 바인딩 전환
             if ((room.p1 === currentUserId || room.p2 === currentUserId) && room.status !== "finished") {
               setRoomId(savedRoomId);
               setPlayerRole(room.p1 === currentUserId ? "p1" : "p2");
               setGameStatus(room.status);
+
+              // 🔧 수정: 재입장 시 playing 상태면 암기 타이머 재실행 안 함
+              if (room.status === "playing") {
+                previewStartedRef.current = true;
+                setPreviewStatus("none");
+                setIsLocked(false);
+              }
               return;
             }
           }
@@ -138,7 +159,7 @@ export default function Home() {
     initializeAuthAndGame();
   }, []);
 
-  // 상시 가동되는 데이터베이스 바인딩 리스너
+  // 전체 유저 데이터 리스너
   useEffect(() => {
     if (!userId) return;
 
@@ -170,6 +191,7 @@ export default function Home() {
     };
   }, [userId]);
 
+  // 관리자 화면 학생 목록 리스너
   useEffect(() => {
     if (gameStatus !== "admin") return;
     const allUsersRef = ref(db, "users");
@@ -191,23 +213,20 @@ export default function Home() {
     return () => unsubscribe();
   }, [gameStatus]);
 
-  // 10초 암기 타이머 연출
+  // 🔧 수정: 10초 암기 타이머 - 재입장 시 중복 실행 방지
   useEffect(() => {
-    if (gameStatus === "playing") {
-      setIsLocked(true); 
+    if (gameStatus === "playing" && !previewStartedRef.current) {
+      previewStartedRef.current = true;
+      setIsLocked(true);
       setPreviewStatus("countdown");
       setCountdownText("3");
       const t1 = setTimeout(() => setCountdownText("2"), 1000);
       const t2 = setTimeout(() => setCountdownText("1"), 2000);
-      
-      const t3 = setTimeout(() => {
-        setPreviewStatus("showAll"); 
-      }, 3000);
-
+      const t3 = setTimeout(() => setPreviewStatus("showAll"), 3000);
       const t4 = setTimeout(() => {
-        setPreviewStatus("none"); 
-        setIsLocked(false); 
-      }, 13000); 
+        setPreviewStatus("none");
+        setIsLocked(false);
+      }, 13000);
 
       return () => {
         clearTimeout(t1);
@@ -217,6 +236,76 @@ export default function Home() {
       };
     }
   }, [gameStatus]);
+
+  // 🔧 추가: 게임방 내 상대방 온라인 상태 감지 & 이탈 시 카운트다운
+  useEffect(() => {
+    if (!roomId || !playerRole || !["rps", "playing"].includes(gameStatus)) return;
+
+    const opponentRole = playerRole === "p1" ? "p2" : "p1";
+    const opponentOnlineRef = ref(db, `rooms/${roomId}/${opponentRole}_online`);
+
+    const unsubscribe = onValue(opponentOnlineRef, (snapshot) => {
+      const isOnline = snapshot.val();
+
+      if (isOnline === false) {
+        // 상대방이 오프라인 표시됨 → 카운트다운 시작
+        if (!opponentDisconnected) {
+          setOpponentDisconnected(true);
+          setDisconnectCountdown(DISCONNECT_TIMEOUT_MS / 1000);
+
+          disconnectIntervalRef.current = setInterval(() => {
+            setDisconnectCountdown((prev) => {
+              if (prev <= 1) {
+                if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
+                return 0;
+              }
+              return prev - 1;
+            });
+          }, 1000);
+
+          disconnectTimerRef.current = setTimeout(() => {
+            // 시간 초과 → 내가 승리 처리 (상대방 0점, 내가 10점으로 강제 설정)
+            const myRole = playerRole;
+            const opRole = opponentRole;
+            const forceScores = { [myRole]: 10, [opRole]: 0 };
+            update(ref(db, `rooms/${roomId}`), {
+              scores: forceScores,
+              status: "finished",
+              forfeitWinner: myRole,
+            });
+          }, DISCONNECT_TIMEOUT_MS);
+        }
+      } else {
+        // 상대방이 다시 접속함 → 카운트다운 취소
+        if (opponentDisconnected) {
+          setOpponentDisconnected(false);
+          setDisconnectCountdown(0);
+          if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+          if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
+        }
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+      if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, playerRole, gameStatus]);
+
+  // 🔧 추가: 내 온라인 상태를 Firebase에 등록 (이탈 시 자동 false 처리)
+  useEffect(() => {
+    if (!roomId || !playerRole || !["rps", "playing"].includes(gameStatus)) return;
+
+    const myOnlineRef = ref(db, `rooms/${roomId}/${playerRole}_online`);
+    set(myOnlineRef, true);
+    onDisconnect(myOnlineRef).set(false);
+
+    return () => {
+      // 컴포넌트 언마운트 시(로비로 이동 등 정상 종료)엔 true 유지 → 게임 끝나면 방 자체가 사라지므로 무관
+    };
+  }, [roomId, playerRole, gameStatus]);
 
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -267,8 +356,7 @@ export default function Home() {
       setAuthError("비밀번호가 일치하지 않습니다.");
       return;
     }
-    
-    // 세션 기록 유지 보장
+
     localStorage.setItem("element_game_user_id", formUsername);
     setUserId(formUsername);
     setNickname(userData.nickname);
@@ -309,24 +397,24 @@ export default function Home() {
     if (snapshot.exists()) {
       const rooms = snapshot.val();
       for (const key in rooms) {
-        if (rooms[key].status === "waiting" && 
-            rooms[key].mode?.elements === useElements && 
-            rooms[key].mode?.ions === useIons) {
-          
+        if (
+          rooms[key].status === "waiting" &&
+          rooms[key].mode?.elements === useElements &&
+          rooms[key].mode?.ions === useIons
+        ) {
           let selectedPairs: any[] = [];
-          
+
           if (useElements && !useIons) {
-            const shuffled = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5);
-            selectedPairs = shuffled.slice(0, 10);
+            selectedPairs = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
           } else if (!useElements && useIons) {
-            const shuffled = [...ION_POOL].sort(() => Math.random() - 0.5);
-            selectedPairs = shuffled.slice(0, 10);
+            selectedPairs = [...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
           } else {
-            const shuffledElements = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5);
-            const shuffledIons = [...ION_POOL].sort(() => Math.random() - 0.5);
-            selectedPairs = [...shuffledElements.slice(0, 5), ...shuffledIons.slice(0, 5)];
+            selectedPairs = [
+              ...[...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
+              ...[...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
+            ];
           }
-          
+
           const rawData: any[] = [];
           selectedPairs.forEach((elem) => {
             rawData.push({ pairId: elem.id, content: elem.symbol, isFlipped: false, matchedBy: null });
@@ -337,14 +425,16 @@ export default function Home() {
 
           await update(ref(db, `rooms/${key}`), {
             p2: userId,
-            status: "rps", 
+            status: "rps",
             board: shuffledBoard,
             scores: { p1: 0, p2: 0 },
             comboCount: 0,
             p1_rps: null,
-            p2_rps: null
+            p2_rps: null,
+            p1_online: true,
+            p2_online: true,
           });
-          
+
           localStorage.setItem("element_game_room_id", key);
           setRoomId(key);
           setPlayerRole("p2");
@@ -360,12 +450,11 @@ export default function Home() {
       await set(newRoomRef, {
         p1: userId,
         status: "waiting",
-        mode: { elements: useElements, ions: useIons }
+        mode: { elements: useElements, ions: useIons },
+        p1_online: true,
       });
-      
+
       localStorage.setItem("element_game_room_id", newRoomId);
-      
-      // 🛠️ [기능 2 반영] 대기방 생성 후 매칭되기 전에 방장이 나가면(새로고침/종료) 방을 파기 예약
       onDisconnect(newRoomRef).remove();
 
       setRoomId(newRoomId);
@@ -373,15 +462,13 @@ export default function Home() {
     }
   };
 
-  // 🛠️ [기능 1 반영] 매칭 대기 중인 유저가 수동으로 취소 요청 시 파기 함수
   const cancelMatching = async () => {
     if (!roomId) return;
     setIsLocked(true);
     try {
       const roomRef = ref(db, `rooms/${roomId}`);
-      await onDisconnect(roomRef).cancel(); // 비정상 예약 철회
-      await remove(roomRef); // 실시간 방 데이터 폭파
-      
+      await onDisconnect(roomRef).cancel();
+      await remove(roomRef);
       localStorage.removeItem("element_game_room_id");
       setRoomId("");
       setPlayerRole(null);
@@ -393,6 +480,7 @@ export default function Home() {
     }
   };
 
+  // 방 데이터 실시간 리스너
   useEffect(() => {
     if (!roomId) return;
     const roomRef = ref(db, `rooms/${roomId}`);
@@ -406,7 +494,6 @@ export default function Home() {
         if (data.scores) setScores(data.scores);
         if (data.comboCount !== undefined) setComboCount(data.comboCount);
 
-        // 🛠️ [기능 2 반영] 매칭이 체결되어 rps나 playing단계로 격상하면 창닫기 시 방 강제폭파 예약을 완전 철회
         if (playerRole === "p1" && data.status !== "waiting") {
           onDisconnect(roomRef).cancel();
         }
@@ -415,6 +502,7 @@ export default function Home() {
     return () => unsubscribe();
   }, [roomId, playerRole]);
 
+  // 가위바위보 결과 처리 (p1만 실행)
   useEffect(() => {
     if (gameStatus === "rps" && playerRole === "p1" && roomData?.p1_rps && roomData?.p2_rps) {
       const p1 = roomData.p1_rps;
@@ -423,17 +511,21 @@ export default function Home() {
         if (p1 === p2) {
           update(ref(db, `rooms/${roomId}`), { p1_rps: null, p2_rps: null });
         } else {
-          const p1Wins = (p1 === "rock" && p2 === "scissors") || (p1 === "scissors" && p2 === "paper") || (p1 === "paper" && p2 === "rock");
-          update(ref(db, `rooms/${roomId}`), { 
-            status: "playing", 
-            currentTurn: p1Wins ? "p1" : "p2" 
+          const p1Wins =
+            (p1 === "rock" && p2 === "scissors") ||
+            (p1 === "scissors" && p2 === "paper") ||
+            (p1 === "paper" && p2 === "rock");
+          update(ref(db, `rooms/${roomId}`), {
+            status: "playing",
+            currentTurn: p1Wins ? "p1" : "p2",
           });
         }
-      }, 2000); 
+      }, 2000);
       return () => clearTimeout(timer);
     }
   }, [gameStatus, playerRole, roomData?.p1_rps, roomData?.p2_rps, roomId]);
 
+  // 모든 카드 매칭 완료 시 게임 종료 (p1만 처리)
   useEffect(() => {
     if (gameStatus === "playing" && scores.p1 + scores.p2 === 10) {
       if (playerRole === "p1") {
@@ -442,22 +534,25 @@ export default function Home() {
     }
   }, [scores, gameStatus, playerRole, roomId]);
 
+  // 🔧 수정: 점수 중복 부여 방지 - ref로 한 번만 실행
   useEffect(() => {
-    if (gameStatus === "finished" && playerRole) {
+    if (gameStatus === "finished" && playerRole && !scoreAppliedRef.current) {
+      scoreAppliedRef.current = true;
+
       const myScore = scores[playerRole];
       const opScore = scores[playerRole === "p1" ? "p2" : "p1"];
       let earnedPoints = 0;
-      
+
       if (myScore > opScore) earnedPoints = 3;
-      else if (myScore === opScore) earnedPoints = 2; 
-      else earnedPoints = 1; 
+      else if (myScore === opScore) earnedPoints = 2;
+      else earnedPoints = 1;
 
       get(ref(db, `users/${userId}/totalScore`)).then((snap) => {
         const currentScore = snap.val() || 0;
         update(ref(db, `users/${userId}`), { totalScore: currentScore + earnedPoints });
       });
     }
-  }, [gameStatus]);
+  }, [gameStatus, playerRole, scores, userId]);
 
   const handleRpsSelect = (choice: string) => {
     update(ref(db, `rooms/${roomId}`), { [`${playerRole}_rps`]: choice });
@@ -489,7 +584,7 @@ export default function Home() {
             [`board/${idx2}/matchedBy`]: currentTurn,
             scores: newScores,
             currentTurn: nextTurn,
-            comboCount: nextCombo
+            comboCount: nextCombo,
           });
           setFlippedIndexes([]);
           setIsLocked(false);
@@ -500,7 +595,7 @@ export default function Home() {
             [`board/${idx1}/isFlipped`]: false,
             [`board/${idx2}/isFlipped`]: false,
             currentTurn: currentTurn === "p1" ? "p2" : "p1",
-            comboCount: 0
+            comboCount: 0,
           });
           setFlippedIndexes([]);
           setIsLocked(false);
@@ -526,7 +621,13 @@ export default function Home() {
   };
 
   const leaveRoom = () => {
-    localStorage.removeItem("element_game_room_id"); // 경기 종료 후 세션 파기
+    // 🔧 수정: 방 떠날 때 모든 ref 초기화
+    scoreAppliedRef.current = false;
+    previewStartedRef.current = false;
+    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+    if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
+
+    localStorage.removeItem("element_game_room_id");
     setGameStatus("lobby");
     setRoomId("");
     setPlayerRole(null);
@@ -536,11 +637,13 @@ export default function Home() {
     setComboCount(0);
     setCurrentTurn("p1");
     setPreviewStatus("none");
+    setOpponentDisconnected(false);
+    setDisconnectCountdown(0);
   };
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-slate-100 p-4 select-none">
-      
+
       {/* 1️⃣ 로그인 화면 */}
       {gameStatus === "login" && (
         <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border-t-8 border-blue-600">
@@ -662,7 +765,7 @@ export default function Home() {
             <div className="mt-2">
               <h1 className="text-4xl font-black mb-2 text-slate-800">🧪 원소 기호 대전</h1>
               <p className="text-gray-400 mb-6">연구원 정보: <span className="text-slate-700 font-bold">{nickname} ({userId})</span></p>
-              
+
               <div className="bg-slate-50 p-4 rounded-xl mb-4 border border-gray-200 text-black text-left">
                 <div className="text-xs font-bold text-gray-400 mb-2">게임 출제 범위 설정</div>
                 <div className="flex gap-6 justify-center py-2">
@@ -707,14 +810,12 @@ export default function Home() {
         </div>
       )}
 
-      {/* 🟡 5️⃣ 대기 화면 */}
+      {/* 5️⃣ 대기 화면 */}
       {gameStatus === "waiting" && (
         <div className="bg-white p-10 rounded-2xl shadow-xl text-center animate-pulse max-w-md w-full">
           <div className="text-6xl mb-4">👀</div>
           <h2 className="text-2xl font-bold text-slate-700 mb-4">동일 모드의 상대방을 매칭 중입니다...</h2>
-          
-          {/* 🛠️ [기능 1 반영] 취소 버튼 설계 */}
-          <button 
+          <button
             onClick={cancelMatching}
             className="mt-6 px-6 py-2.5 bg-red-500 text-white font-bold rounded-xl hover:bg-red-600 shadow-sm transition-colors text-sm"
           >
@@ -723,9 +824,15 @@ export default function Home() {
         </div>
       )}
 
-      {/* 🟠 가위바위보 화면 */}
+      {/* 6️⃣ 가위바위보 화면 */}
       {gameStatus === "rps" && (
         <div className="bg-white p-10 rounded-2xl shadow-xl text-center w-full max-w-2xl">
+          {/* 🔧 추가: 상대방 이탈 알림 배너 */}
+          {opponentDisconnected && (
+            <div className="mb-6 p-4 bg-red-50 border border-red-300 rounded-xl text-red-700 font-bold">
+              ⚠️ 상대방 연결이 끊겼습니다. {disconnectCountdown}초 안에 돌아오지 않으면 자동 승리 처리됩니다.
+            </div>
+          )}
           <h2 className="text-3xl font-black mb-8 text-slate-800">✊✌️🖐️ 가위바위보!</h2>
           <div className="flex justify-around items-center mb-10">
             <div className="flex flex-col items-center">
@@ -738,9 +845,9 @@ export default function Home() {
             <div className="flex flex-col items-center">
               <span className="text-lg font-bold text-red-600 mb-2">상대방</span>
               <div className="text-6xl bg-slate-100 p-6 rounded-2xl">
-                {roomData?.p1_rps && roomData?.p2_rps 
-                  ? getEmoji(playerRole === "p1" ? roomData.p2_rps : roomData.p1_rps) 
-                  : (roomData?.[playerRole === "p1" ? "p2_rps" : "p1_rps"] ? "✔️" : "⏳")}
+                {roomData?.p1_rps && roomData?.p2_rps
+                  ? getEmoji(playerRole === "p1" ? roomData.p2_rps : roomData.p1_rps)
+                  : roomData?.[playerRole === "p1" ? "p2_rps" : "p1_rps"] ? "✔️" : "⏳"}
               </div>
             </div>
           </div>
@@ -757,7 +864,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* 🔴 본 게임 화면 */}
+      {/* 7️⃣ 본 게임 화면 */}
       {gameStatus === "playing" && (
         <>
           {previewStatus === "countdown" && (
@@ -772,6 +879,13 @@ export default function Home() {
           {previewStatus === "showAll" && (
             <div className="fixed top-0 left-0 right-0 bg-gradient-to-r from-amber-500 to-orange-500 text-white text-center py-3 font-black text-xl z-50 shadow-md animate-pulse">
               ⚡ 👀 10초 동안 카드를 잘 기억하세요! ⚡
+            </div>
+          )}
+
+          {/* 🔧 추가: 게임 중 상대방 이탈 알림 */}
+          {opponentDisconnected && (
+            <div className="fixed top-0 left-0 right-0 bg-red-500 text-white text-center py-3 font-black text-lg z-50 shadow-md">
+              ⚠️ 상대방 연결 끊김! {disconnectCountdown}초 안에 돌아오지 않으면 자동 승리 처리됩니다.
             </div>
           )}
 
@@ -794,7 +908,7 @@ export default function Home() {
               🔴 P2: {scores.p2}점
             </div>
           </div>
-          
+
           <div className="grid grid-cols-5 gap-2 sm:gap-3 max-w-3xl w-full mx-auto px-2">
             {cards.map((card) => {
               const isShowing = previewStatus === "showAll" || card.isFlipped || card.matchedBy;
@@ -811,9 +925,9 @@ export default function Home() {
                 );
               }
 
-              let cardStyles = "bg-white text-black border-2 border-gray-800"; 
+              let cardStyles = "bg-white text-black border-2 border-gray-800";
               if (card.matchedBy === "p1") cardStyles = "bg-blue-200 text-blue-900 border-2 border-blue-500";
-              if (card.matchedBy === "p2") cardStyles = "bg-red-200 text-red-900 border-2 border-red-500"; 
+              if (card.matchedBy === "p2") cardStyles = "bg-red-200 text-red-900 border-2 border-red-500";
               if (previewStatus === "showAll") cardStyles = "bg-amber-50 text-amber-900 border-2 border-amber-400";
 
               return (
@@ -829,10 +943,16 @@ export default function Home() {
         </>
       )}
 
-      {/* 🏁 결과 화면 */}
+      {/* 8️⃣ 결과 화면 */}
       {gameStatus === "finished" && (
         <div className="bg-white p-10 rounded-2xl shadow-xl text-center w-full max-w-lg">
           <h2 className="text-4xl font-black mb-6 text-slate-800">게임 종료!</h2>
+          {/* 🔧 추가: 몰수패 안내 */}
+          {roomData?.forfeitWinner && (
+            <div className={`mb-4 p-3 rounded-xl font-bold text-sm ${roomData.forfeitWinner === playerRole ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
+              {roomData.forfeitWinner === playerRole ? "🏳️ 상대방 연결 끊김으로 자동 승리 처리되었습니다." : "🔌 연결이 끊겨 몰수패 처리되었습니다."}
+            </div>
+          )}
           <div className="flex justify-around items-center mb-8 bg-slate-50 p-6 rounded-xl">
             <div className="text-center">
               <div className="text-sm font-bold text-blue-600 mb-1">P1 점수</div>
@@ -845,9 +965,9 @@ export default function Home() {
             </div>
           </div>
           <div className="text-3xl font-bold mb-8">
-            {scores[playerRole!] > scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-blue-600">🎉 승리! (+3점)</span>}
-            {scores[playerRole!] < scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-gray-500">패배... (+1점)</span>}
-            {scores[playerRole!] === scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-green-600">🤝 무승부! (+2점)</span>}
+            {playerRole && scores[playerRole] > scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-blue-600">🎉 승리! (+3점)</span>}
+            {playerRole && scores[playerRole] < scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-gray-500">패배... (+1점)</span>}
+            {playerRole && scores[playerRole] === scores[playerRole === "p1" ? "p2" : "p1"] && <span className="text-green-600">🤝 무승부! (+2점)</span>}
           </div>
           <button onClick={leaveRoom} className="px-8 py-4 bg-slate-800 text-white text-xl font-bold rounded-xl hover:bg-slate-900 shadow-md">
             로비로 돌아가기
