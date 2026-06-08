@@ -124,6 +124,7 @@ export default function Home() {
   const [comboCount,    setComboCount]    = useState(0);
   const [scores,        setScores]        = useState({ p1: 0, p2: 0 });
   const [isLocked,      setIsLocked]      = useState(false);
+  const [showRanking,   setShowRanking]   = useState(false);
 
   // 상대방 이탈 감지
   const [opponentDisconnected, setOpponentDisconnected] = useState(false);
@@ -774,77 +775,85 @@ export default function Home() {
       )}
 
       {/* ── 4. 로비 ── */}
+      {/* 4️⃣ 로비 화면 (중앙 정렬 및 랭킹 팝업 적용) */}
       {gameStatus === "lobby" && (
-        <div className="flex flex-col md:flex-row gap-6 w-full max-w-5xl">
-          {/* 왼쪽: 게임 참가 */}
-          <div className="flex-1 bg-white p-8 rounded-2xl shadow-xl text-center border-t-8 border-blue-500 flex flex-col justify-between">
-            <div className="text-right">
+        <>
+          <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border-t-8 border-blue-600">
+            <div className="text-right mb-2">
               <button onClick={handleLogout} className="text-xs font-bold text-gray-400 hover:text-red-500 hover:underline">로그아웃</button>
             </div>
-            <div className="mt-2">
+            <div className="text-center mt-2">
               <h1 className="text-4xl font-black mb-2 text-slate-800">🧪 원소 기호 대전</h1>
               <p className="text-gray-400 mb-6">연구원 정보: <span className="text-slate-700 font-bold">{nickname} ({userId})</span></p>
+              
               <div className="bg-slate-50 p-4 rounded-xl mb-4 border border-gray-200 text-black text-left">
                 <div className="text-xs font-bold text-gray-400 mb-2">게임 출제 범위 설정</div>
-                <div className="flex gap-6 justify-center py-2">
-                  <label className="flex items-center gap-2 font-bold cursor-pointer text-lg">
+                <div className="flex flex-col sm:flex-row gap-4 justify-center py-2">
+                  <label className="flex items-center gap-2 font-bold cursor-pointer text-sm">
                     <input type="checkbox" checked={useElements} onChange={(e) => setUseElements(e.target.checked)} className="w-5 h-5 accent-blue-600" />
-                    원소기호 (1~20번+필수6종)
+                    원소기호 모음
                   </label>
-                  <label className="flex items-center gap-2 font-bold cursor-pointer text-lg">
+                  <label className="flex items-center gap-2 font-bold cursor-pointer text-sm">
                     <input type="checkbox" checked={useIons} onChange={(e) => setUseIons(e.target.checked)} className="w-5 h-5 accent-blue-600" />
-                    이온세트 (필수16종)
+                    이온세트 모음
                   </label>
                 </div>
               </div>
+
               <div className="bg-blue-50 p-4 rounded-xl mb-6">
                 <div className="text-sm text-blue-500 font-bold mb-1">내 누적 승점</div>
                 <div className="text-4xl font-black text-blue-600">{myTotalScore}점</div>
               </div>
             </div>
-            <button onClick={joinGame} className="w-full py-5 bg-blue-600 text-white text-2xl font-bold rounded-xl hover:bg-blue-700 shadow-md transition-all">
-              게임 참가하기 ⚔️
-            </button>
+            
+            <div className="flex gap-3">
+              <button onClick={() => setShowRanking(true)} className="flex-[1] py-4 bg-amber-500 text-white text-lg font-bold rounded-xl hover:bg-amber-600 shadow-md transition-all">
+                🏆 랭킹
+              </button>
+              <button onClick={joinGame} className="flex-[2] py-4 bg-blue-600 text-white text-lg font-bold rounded-xl hover:bg-blue-700 shadow-md transition-all">
+                게임 참가하기 ⚔️
+              </button>
+            </div>
           </div>
 
-          {/* 오른쪽: 랭킹 (승/무/패/승률) */}
-          <div className="w-full md:w-96 bg-white p-6 rounded-2xl shadow-xl flex flex-col border-t-8 border-amber-500">
-            <h2 className="text-xl font-black text-slate-800 mb-3 flex items-center gap-2">🏆 우수 연구원 랭킹</h2>
-            {/* 헤더 */}
-            <div className="grid grid-cols-[1.5rem_1fr_2.5rem_2rem_2rem_2rem_3rem] gap-x-1 items-center px-2 pb-1 border-b border-gray-200 text-xs font-bold text-gray-400">
-              <span>#</span>
-              <span>닉네임</span>
-              <span className="text-center text-blue-500">승점</span>
-              <span className="text-center text-green-600">승</span>
-              <span className="text-center text-yellow-500">무</span>
-              <span className="text-center text-red-500">패</span>
-              <span className="text-center text-purple-500">승률</span>
+          {/* 🏆 랭킹 팝업창 */}
+          {showRanking && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex flex-col items-center justify-center p-4">
+              <div className="bg-white w-full max-w-sm rounded-2xl shadow-2xl flex flex-col max-h-[80vh] border-t-8 border-amber-500 overflow-hidden">
+                <div className="p-5 border-b flex justify-between items-center bg-slate-50">
+                  <h2 className="text-xl font-black text-slate-800 flex items-center gap-2">
+                    🏆 우수 연구원 랭킹
+                  </h2>
+                  <button onClick={() => setShowRanking(false)} className="text-gray-400 hover:text-gray-700 font-bold text-3xl leading-none">
+                    &times;
+                  </button>
+                </div>
+                <div className="overflow-y-auto p-5 space-y-2 flex-1">
+                  {leaderboard.map((user, index) => {
+                    const isMe = user.id === userId;
+                    return (
+                      <div key={user.id} className={`flex justify-between items-center p-3 rounded-lg text-sm font-semibold ${isMe ? "bg-amber-100 border border-amber-400 text-amber-900" : "bg-slate-50 text-slate-700"}`}>
+                        <div className="flex items-center gap-2">
+                          <span className={`w-5 text-center font-bold ${index < 3 ? "text-amber-500" : "text-gray-400"}`}>{index + 1}</span>
+                          <span className="truncate max-w-[120px]">{user.nickname}</span>
+                        </div>
+                        <span className="font-black">{user.totalScore}점</span>
+                      </div>
+                    );
+                  })}
+                  {leaderboard.length === 0 && (
+                    <div className="text-center text-gray-400 font-bold py-4">아직 랭킹 기록이 없습니다.</div>
+                  )}
+                </div>
+                <div className="p-4 border-t bg-white">
+                  <button onClick={() => setShowRanking(false)} className="w-full py-3 bg-slate-200 text-slate-800 font-bold rounded-xl hover:bg-slate-300 transition-colors">
+                    닫기
+                  </button>
+                </div>
+              </div>
             </div>
-            <div className="flex-1 overflow-y-auto mt-1 space-y-1 pr-1">
-              {leaderboard.map((user, index) => {
-                const isMe  = user.id === userId;
-                const total = user.wins + user.draws + user.losses;
-                const wr    = total === 0 ? "-" : Math.round((user.wins / total) * 100) + "%";
-                return (
-                  <div key={user.id}
-                    className={`grid grid-cols-[1.5rem_1fr_2.5rem_2rem_2rem_2rem_3rem] gap-x-1 items-center px-2 py-2 rounded-lg text-sm
-                      ${isMe ? "bg-amber-100 border border-amber-400" : "bg-slate-50"}`}>
-                    <span className={`font-black text-center
-                      ${index === 0 ? "text-yellow-500" : index === 1 ? "text-gray-400" : index === 2 ? "text-amber-600" : "text-gray-300"}`}>
-                      {index + 1}
-                    </span>
-                    <span className={`font-bold truncate ${isMe ? "text-amber-900" : "text-slate-700"}`}>{user.nickname}</span>
-                    <span className="text-center font-black text-blue-600">{user.totalScore}</span>
-                    <span className="text-center font-bold text-green-600">{user.wins}</span>
-                    <span className="text-center font-bold text-yellow-600">{user.draws}</span>
-                    <span className="text-center font-bold text-red-500">{user.losses}</span>
-                    <span className="text-center font-bold text-purple-600">{wr}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
+          )}
+        </>
       )}
 
       {/* ── 5. 대기 ── */}
