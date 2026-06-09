@@ -489,7 +489,32 @@ export default function Home() {
       await remove(ref(db, `users/${id}`));
   };
 
-  // ── ✅ 수정 2: 게임 참가 — 트랜잭션으로 동시 참가 버그 방지 ──
+  // ── 카드 보드 생성 헬퍼 (트랜잭션 밖에서 호출) ─────────────
+  const buildBoard = () => {
+    let selectedPairs: any[] = [];
+    if (useElements && !useIons)
+      selectedPairs = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
+    else if (!useElements && useIons)
+      selectedPairs = [...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
+    else
+      selectedPairs = [
+        ...[...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
+        ...[...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
+      ];
+    const rawData: any[] = [];
+    selectedPairs.forEach((elem) => {
+      rawData.push({ pairId: elem.id, content: elem.symbol, isFlipped: false, matchedBy: null });
+      rawData.push({ pairId: elem.id, content: elem.name,   isFlipped: false, matchedBy: null });
+    });
+    rawData.sort(() => Math.random() - 0.5);
+    return rawData.map((card, idx) => ({ ...card, id: idx }));
+  };
+
+  // ── 게임 참가 ────────────────────────────────────────────────
+  // 핵심 전략:
+  //   1) 트랜잭션은 "p2 자리 선점" 만 담당 (순수 상태 변경, 랜덤 없음)
+  //   2) 트랜잭션 성공 후 카드 보드를 별도 update로 기록
+  //   → 트랜잭션 재시도 문제 완전 차단
   const joinGame = async () => {
     if (!useElements && !useIons) {
       alert("원소기호와 이온 중 최소 하나는 선택해야 합니다.");
@@ -497,69 +522,47 @@ export default function Home() {
     }
     setGameStatus("waiting");
 
-    // 빈 방 목록 스냅샷을 먼저 조회
     const snap = await get(ref(db, "rooms"));
     let joinedRoomId: string | null = null;
 
     if (snap.exists()) {
       const rooms = snap.val();
-      // 조건에 맞는 대기 방 키를 모두 수집
       const candidateKeys = Object.keys(rooms).filter(
         (key) =>
           rooms[key].status === "waiting" &&
-          rooms[key].p1 !== userId &&        // 내가 만든 방 제외
+          rooms[key].p1 !== userId &&
+          !rooms[key].p2 &&                  // p2가 아직 없는 방만
           rooms[key].mode?.elements === useElements &&
           rooms[key].mode?.ions     === useIons
       );
 
-      // 트랜잭션으로 첫 번째 빈 방에 입장 시도 (동시 접근 방지)
       for (const key of candidateKeys) {
         const roomRef = ref(db, `rooms/${key}`);
-        let success = false;
+        let committed = false;
 
+        // 트랜잭션: 오직 p2/status 필드만 변경 (랜덤 연산 없음)
         await runTransaction(roomRef, (current) => {
-          // 트랜잭션 도중 방 상태 재확인
           if (!current || current.status !== "waiting" || current.p2) {
-            return; // abort → 다른 방 시도
+            return; // 이미 누군가 입장 → abort
           }
+          return { ...current, p2: userId, status: "rps_pending" };
+        }).then((result) => {
+          committed = result.committed;
+        }).catch(() => {});
 
-          // 카드 생성
-          let selectedPairs: any[] = [];
-          if (useElements && !useIons)
-            selectedPairs = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
-          else if (!useElements && useIons)
-            selectedPairs = [...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
-          else
-            selectedPairs = [
-              ...[...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
-              ...[...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
-            ];
-
-          const rawData: any[] = [];
-          selectedPairs.forEach((elem) => {
-            rawData.push({ pairId: elem.id, content: elem.symbol, isFlipped: false, matchedBy: null });
-            rawData.push({ pairId: elem.id, content: elem.name,   isFlipped: false, matchedBy: null });
-          });
-          rawData.sort(() => Math.random() - 0.5);
-          const shuffledBoard = rawData.map((card, idx) => ({ ...card, id: idx }));
-
-          return {
-            ...current,
-            p2:        userId,
+        if (committed) {
+          // 트랜잭션 성공 → 카드 보드 및 나머지 필드를 별도 update
+          const board = buildBoard();
+          await update(roomRef, {
             status:    "rps",
-            board:     shuffledBoard,
+            board,
             scores:    { p1: 0, p2: 0 },
             comboCount: 0,
             p1_rps:    null,
             p2_rps:    null,
             p1_online: true,
             p2_online: true,
-          };
-        }).then((result) => {
-          if (result.committed) success = true;
-        }).catch(() => {});
-
-        if (success) {
+          });
           joinedRoomId = key;
           break;
         }
@@ -599,26 +602,34 @@ export default function Home() {
     } catch (e) { console.error(e); } finally { setIsLocked(false); }
   };
 
-  // ── ✅ 수정 3: 가위바위보 나가기 (로비로 복귀) ──────────────
+  // ── 가위바위보 나가기 (패배 처리 없이 단순 취소) ────────────
   const leaveRps = async () => {
-    if (!confirm("가위바위보를 포기하고 로비로 돌아가시겠습니까?")) return;
+    if (!confirm("가위바위보를 취소하고 로비로 돌아가시겠습니까?")) return;
     if (roomId) {
       try {
-        // 상대방이 이미 있으면 상대 자동 승리 처리, 없으면 방 삭제
-        const snap = await get(ref(db, `rooms/${roomId}`));
+        const roomRef = ref(db, `rooms/${roomId}`);
+        const snap    = await get(roomRef);
         if (snap.exists()) {
-          const room = snap.val();
+          const room   = snap.val();
           const opRole = playerRole === "p1" ? "p2" : "p1";
           if (room[opRole]) {
-            // 상대방 있음 → 포기 처리
-            await update(ref(db, `rooms/${roomId}`), {
-              scores:       { [playerRole!]: 0, [opRole]: 10 },
-              status:       "finished",
-              forfeitWinner: opRole,
+            // 상대방이 이미 있는 경우 → 상대방을 p1로 남기고 방을 대기 상태로 초기화
+            // (상대방은 로비로 강제 이동되지 않고 계속 새 매칭을 기다릴 수 있음)
+            await update(roomRef, {
+              [playerRole === "p1" ? "p1" : "p2"]: null,
+              p2:        playerRole === "p2" ? null : room.p2,
+              p1:        playerRole === "p1" ? room.p2 : room.p1, // 남은 사람을 p1으로
+              status:    "waiting",
+              board:     null,
+              scores:    null,
+              comboCount: null,
+              p1_rps:    null,
+              p2_rps:    null,
+              p2_online: playerRole === "p2" ? null : room.p2_online,
             });
           } else {
-            // 방에 나만 있음 → 방 삭제
-            await remove(ref(db, `rooms/${roomId}`));
+            // 나 혼자인 방 → 삭제
+            await remove(roomRef);
           }
         }
       } catch (e) { console.error(e); }
