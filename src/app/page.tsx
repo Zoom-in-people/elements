@@ -510,11 +510,10 @@ export default function Home() {
     return rawData.map((card, idx) => ({ ...card, id: idx }));
   };
 
-  // ── 게임 참가 ────────────────────────────────────────────────
+// ── 게임 참가 ────────────────────────────────────────────────
   // 핵심 전략:
-  //   1) 트랜잭션은 "p2 자리 선점" 만 담당 (순수 상태 변경, 랜덤 없음)
-  //   2) 트랜잭션 성공 후 카드 보드를 별도 update로 기록
-  //   → 트랜잭션 재시도 문제 완전 차단
+  //   1) 트랜잭션은 "p2 자리 선점" 만 담당하여 동시 접속(3명 버그) 완벽 차단
+  //   2) 선점 성공 후 방 상태 최종 확인 및 보드 세팅
   const joinGame = async () => {
     if (!useElements && !useIons) {
       alert("원소기호와 이온 중 최소 하나는 선택해야 합니다.");
@@ -537,34 +536,41 @@ export default function Home() {
       );
 
       for (const key of candidateKeys) {
-        const roomRef = ref(db, `rooms/${key}`);
+        // 🔥 수정된 부분: 방 전체가 아닌 'p2' 필드 하나만 트랜잭션으로 잠금 시도
+        const p2Ref = ref(db, `rooms/${key}/p2`);
         let committed = false;
 
-        // 트랜잭션: 오직 p2/status 필드만 변경 (랜덤 연산 없음)
-        await runTransaction(roomRef, (current) => {
-          if (!current || current.status !== "waiting" || current.p2) {
-            return; // 이미 누군가 입장 → abort
+        await runTransaction(p2Ref, (current) => {
+          if (current === null) {
+            return userId; // p2 자리가 비어있으면 내 ID로 즉시 선점
           }
-          return { ...current, p2: userId, status: "rps_pending" };
+          return undefined; // 누군가 0.1초 차이로 먼저 선점했다면 취소(abort)
         }).then((result) => {
           committed = result.committed;
         }).catch(() => {});
 
         if (committed) {
-          // 트랜잭션 성공 → 카드 보드 및 나머지 필드를 별도 update
-          const board = buildBoard();
-          await update(roomRef, {
-            status:    "rps",
-            board,
-            scores:    { p1: 0, p2: 0 },
-            comboCount: 0,
-            p1_rps:    null,
-            p2_rps:    null,
-            p1_online: true,
-            p2_online: true,
-          });
-          joinedRoomId = key;
-          break;
+          // p2 자리를 성공적으로 차지함! 방장이 그 사이 취소하지 않았는지 최종 확인
+          const statusSnap = await get(ref(db, `rooms/${key}/status`));
+          if (statusSnap.val() === "waiting") {
+            // 유효한 방이므로 게임 세팅 진행
+            const board = buildBoard();
+            await update(ref(db, `rooms/${key}`), {
+              status:    "rps",
+              board,
+              scores:    { p1: 0, p2: 0 },
+              comboCount: 0,
+              p1_rps:    null,
+              p2_rps:    null,
+              p1_online: true,
+              p2_online: true,
+            });
+            joinedRoomId = key;
+            break; // 매칭 성공, 루프 탈출
+          } else {
+            // 찰나의 순간에 방장이 취소했거나 이상이 생겼다면 롤백
+            await set(p2Ref, null);
+          }
         }
       }
     }
