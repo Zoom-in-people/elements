@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { db } from "@/lib/firebase";
-import { ref, get, set, update, remove, onValue, onDisconnect } from "firebase/database";
+import { ref, get, set, update, remove, onValue, onDisconnect, runTransaction } from "firebase/database";
 
 interface Card {
   id: number;
@@ -80,15 +80,13 @@ const ION_POOL = [
   { id: "ion_Cu",   symbol: "Cu²⁺",  name: "구리 이온(2+)" },
   { id: "ion_Pb",   symbol: "Pb²⁺",  name: "납 이온" },
   { id: "ion_Zn",   symbol: "Zn²⁺",  name: "아연 이온" },
-  { id: "ion_SO4",   symbol: "SO₄²⁻",  name: "황산 이온" },
-  { id: "ion_CO3",   symbol: "CO₃²⁻",  name: "탄산 이온" },
+  { id: "ion_SO4",  symbol: "SO₄²⁻", name: "황산 이온" },
+  { id: "ion_CO3",  symbol: "CO₃²⁻", name: "탄산 이온" },
 ];
 
 const DISCONNECT_TIMEOUT_MS = 30000;
-// 카드 1장당 선택 제한 시간(초)
-const CARD_SELECT_TIMEOUT = 5;
-// '내 차례!' 알림이 보이는 시간(ms)
-const MY_TURN_NOTICE_MS = 2000;
+const CARD_SELECT_TIMEOUT   = 5;
+const MY_TURN_NOTICE_MS     = 2000;
 
 export default function Home() {
   const [gameStatus, setGameStatus] = useState<
@@ -98,16 +96,17 @@ export default function Home() {
   const [userId,       setUserId]       = useState("");
   const [nickname,     setNickname]     = useState("");
   const [myTotalScore, setMyTotalScore] = useState(0);
+  // ✅ 수정 1: 이온 기본값을 false로 변경
   const [useElements,  setUseElements]  = useState(true);
-  const [useIons,      setUseIons]      = useState(true);
+  const [useIons,      setUseIons]      = useState(false);
 
   const [formUsername, setFormUsername] = useState("");
   const [formPassword, setFormPassword] = useState("");
   const [formNickname, setFormNickname] = useState("");
   const [authError,    setAuthError]    = useState("");
 
-  const [studentList, setStudentList] = useState<UserAccount[]>([]);
-  const [editingId,   setEditingId]   = useState<string | null>(null);
+  const [studentList,  setStudentList]  = useState<UserAccount[]>([]);
+  const [editingId,    setEditingId]    = useState<string | null>(null);
   const [editNickname, setEditNickname] = useState("");
   const [editPassword, setEditPassword] = useState("");
 
@@ -126,29 +125,24 @@ export default function Home() {
   const [isLocked,      setIsLocked]      = useState(false);
   const [showRanking,   setShowRanking]   = useState(false);
 
-  // 상대방 이탈 감지
   const [opponentDisconnected, setOpponentDisconnected] = useState(false);
   const [disconnectCountdown,  setDisconnectCountdown]  = useState(0);
-  const disconnectTimerRef   = useRef<ReturnType<typeof setTimeout>  | null>(null);
+  const disconnectTimerRef    = useRef<ReturnType<typeof setTimeout>  | null>(null);
   const disconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // 중복 방지 ref
   const scoreAppliedRef   = useRef(false);
   const previewStartedRef = useRef(false);
 
-  // ── 새 기능: 턴 타이머 ────────────────────────────────────────
-  // cardTimerSec: 현재 카드 선택까지 남은 초 (0이면 비활성)
-  const [cardTimerSec,   setCardTimerSec]   = useState(0);
-  const cardTimerRef     = useRef<ReturnType<typeof setInterval> | null>(null);
-  // firstCardSelected: 첫 번째 카드를 골랐는지
+  const [cardTimerSec,    setCardTimerSec]    = useState(0);
+  const cardTimerRef      = useRef<ReturnType<typeof setInterval> | null>(null);
   const [firstCardPicked, setFirstCardPicked] = useState(false);
 
-  // ── 새 기능: "내 차례!" 알림 ──────────────────────────────────
-  const [showMyTurnNotice, setShowMyTurnNotice] = useState(false);
-  const prevTurnRef = useRef<"p1" | "p2" | null>(null);
-
-  // ── 새 기능: 연속 3회 달성 알림 ──────────────────────────────
+  // ✅ 수정 4: "내 차례!" 알림 관련 — gameReady 플래그 추가
+  const [showMyTurnNotice,  setShowMyTurnNotice]  = useState(false);
   const [showMaxComboNotice, setShowMaxComboNotice] = useState(false);
+  const prevTurnRef  = useRef<"p1" | "p2" | null>(null);
+  // 게임판이 실제로 플레이 가능 상태가 되었을 때만 true
+  const gameReadyRef = useRef(false);
 
   // ── 카드 타이머 헬퍼 ─────────────────────────────────────────
   const clearCardTimer = useCallback(() => {
@@ -175,6 +169,16 @@ export default function Home() {
     }, 1000);
   }, [clearCardTimer]);
 
+  // ── ✅ 수정 5: 창 닫으면 자동 로그아웃 ──────────────────────
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      localStorage.removeItem("element_game_user_id");
+      localStorage.removeItem("element_game_room_id");
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
+
   // ── 초기화 ───────────────────────────────────────────────────
   useEffect(() => {
     const init = async () => {
@@ -195,6 +199,7 @@ export default function Home() {
               setGameStatus(room.status);
               if (room.status === "playing") {
                 previewStartedRef.current = true;
+                gameReadyRef.current      = true;
                 setPreviewStatus("none");
                 setIsLocked(false);
               }
@@ -259,43 +264,54 @@ export default function Home() {
     return () => unsub();
   }, [gameStatus]);
 
-  // ── 암기 타이머 (게임 시작 시 1회) ──────────────────────────
+  // ── ✅ 수정 4: 암기 타이머 — 끝난 뒤에 gameReady 플래그 ON ─
   useEffect(() => {
     if (gameStatus === "playing" && !previewStartedRef.current) {
       previewStartedRef.current = true;
+      gameReadyRef.current      = false;  // 아직 암기 중 → 알림 비활성
       setIsLocked(true);
       setPreviewStatus("countdown");
       setCountdownText("3");
       const t1 = setTimeout(() => setCountdownText("2"), 1000);
       const t2 = setTimeout(() => setCountdownText("1"), 2000);
-      const t3 = setTimeout(() => setPreviewStatus("showAll"),  3000);
-      const t4 = setTimeout(() => { setPreviewStatus("none"); setIsLocked(false); }, 13000);
-      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
+      const t3 = setTimeout(() => setPreviewStatus("showAll"), 3000);
+      const t4 = setTimeout(() => {
+        setPreviewStatus("none");
+        setIsLocked(false);
+        // 암기 완료 → 이제부터 "내 차례!" 알림 허용
+        gameReadyRef.current  = true;
+        prevTurnRef.current   = null;   // 강제 리셋 → 첫 턴 알림 트리거
+        setCurrentTurn((t) => t);       // 리렌더 유도
+      }, 13000);
+      return () => {
+        clearTimeout(t1); clearTimeout(t2);
+        clearTimeout(t3); clearTimeout(t4);
+      };
     }
   }, [gameStatus]);
 
-  // ── "내 차례!" 알림: currentTurn 변화 감지 ───────────────────
+  // ── ✅ 수정 4: "내 차례!" 알림 — gameReady + previewStatus 조건 강화 ──
   useEffect(() => {
     if (
       gameStatus === "playing" &&
+      gameReadyRef.current &&
       previewStatus === "none" &&
       playerRole &&
       currentTurn === playerRole &&
-      prevTurnRef.current !== playerRole   // 이전과 달라졌을 때만
+      prevTurnRef.current !== playerRole
     ) {
+      prevTurnRef.current = playerRole;
       setShowMyTurnNotice(true);
-      setIsLocked(true);          // 알림 동안 클릭 차단
-      clearCardTimer();           // 혹시 남아있는 타이머 제거
+      setIsLocked(true);
+      clearCardTimer();
       const t = setTimeout(() => {
         setShowMyTurnNotice(false);
         setIsLocked(false);
-        // 알림이 사라진 뒤 첫 번째 카드 타이머 시작
         startCardTimer(() => {
-          // 시간 초과 → 첫 카드 미선택 → 턴 넘김
           if (playerRole) {
             update(ref(db, `rooms/${roomId}`), {
               currentTurn: playerRole === "p1" ? "p2" : "p1",
-              comboCount: 0,
+              comboCount:  0,
             });
           }
           setFirstCardPicked(false);
@@ -303,15 +319,18 @@ export default function Home() {
       }, MY_TURN_NOTICE_MS);
       return () => clearTimeout(t);
     }
-    prevTurnRef.current = currentTurn;
+    // 상대 턴으로 바뀌면 prevTurnRef를 상대방으로 업데이트
+    if (currentTurn !== playerRole) {
+      prevTurnRef.current = currentTurn;
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTurn, gameStatus, previewStatus]);
 
   // ── 상대방 온라인 감지 ───────────────────────────────────────
   useEffect(() => {
     if (!roomId || !playerRole || !["rps", "playing"].includes(gameStatus)) return;
-    const opRole       = playerRole === "p1" ? "p2" : "p1";
-    const opOnlineRef  = ref(db, `rooms/${roomId}/${opRole}_online`);
+    const opRole      = playerRole === "p1" ? "p2" : "p1";
+    const opOnlineRef = ref(db, `rooms/${roomId}/${opRole}_online`);
     const unsub = onValue(opOnlineRef, (snap) => {
       const isOnline = snap.val();
       if (isOnline === false) {
@@ -335,14 +354,14 @@ export default function Home() {
         if (opponentDisconnected) {
           setOpponentDisconnected(false);
           setDisconnectCountdown(0);
-          if (disconnectTimerRef.current)   clearTimeout(disconnectTimerRef.current);
+          if (disconnectTimerRef.current)    clearTimeout(disconnectTimerRef.current);
           if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
         }
       }
     });
     return () => {
       unsub();
-      if (disconnectTimerRef.current)   clearTimeout(disconnectTimerRef.current);
+      if (disconnectTimerRef.current)    clearTimeout(disconnectTimerRef.current);
       if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -364,10 +383,10 @@ export default function Home() {
       const data = snap.val();
       if (data) {
         setRoomData(data);
-        if (data.status)                  setGameStatus(data.status);
-        if (data.board)                   setCards(data.board);
-        if (data.currentTurn)             setCurrentTurn(data.currentTurn);
-        if (data.scores)                  setScores(data.scores);
+        if (data.status)                   setGameStatus(data.status);
+        if (data.board)                    setCards(data.board);
+        if (data.currentTurn)              setCurrentTurn(data.currentTurn);
+        if (data.scores)                   setScores(data.scores);
         if (data.comboCount !== undefined) setComboCount(data.comboCount);
         if (playerRole === "p1" && data.status !== "waiting") onDisconnect(roomRef).cancel();
       }
@@ -385,7 +404,7 @@ export default function Home() {
         } else {
           const p1Wins =
             (p1 === "rock"     && p2 === "scissors") ||
-            (p1 === "scissors" && p2 === "paper") ||
+            (p1 === "scissors" && p2 === "paper")    ||
             (p1 === "paper"    && p2 === "rock");
           update(ref(db, `rooms/${roomId}`), {
             status: "playing", currentTurn: p1Wins ? "p1" : "p2",
@@ -404,7 +423,7 @@ export default function Home() {
     }
   }, [scores, gameStatus, playerRole, roomId, clearCardTimer]);
 
-  // ── 점수 적립 (승/무/패 포함) ───────────────────────────────
+  // ── 점수 적립 ───────────────────────────────────────────────
   useEffect(() => {
     if (gameStatus === "finished" && playerRole && !scoreAppliedRef.current) {
       scoreAppliedRef.current = true;
@@ -413,9 +432,9 @@ export default function Home() {
       const opScore = scores[playerRole === "p1" ? "p2" : "p1"];
       let earnedPoints = 0;
       let resultKey: "wins" | "draws" | "losses";
-      if      (myScore > opScore) { earnedPoints = 3; resultKey = "wins"; }
+      if      (myScore > opScore)  { earnedPoints = 3; resultKey = "wins"; }
       else if (myScore === opScore) { earnedPoints = 2; resultKey = "draws"; }
-      else                         { earnedPoints = 1; resultKey = "losses"; }
+      else                          { earnedPoints = 1; resultKey = "losses"; }
 
       get(ref(db, `users/${userId}`)).then((snap) => {
         const d = snap.val() || {};
@@ -470,20 +489,41 @@ export default function Home() {
       await remove(ref(db, `users/${id}`));
   };
 
-  // ── 핸들러: 게임 참가 ────────────────────────────────────────
+  // ── ✅ 수정 2: 게임 참가 — 트랜잭션으로 동시 참가 버그 방지 ──
   const joinGame = async () => {
-    if (!useElements && !useIons) { alert("원소기호와 이온 중 최소 하나는 선택해야 합니다."); return; }
+    if (!useElements && !useIons) {
+      alert("원소기호와 이온 중 최소 하나는 선택해야 합니다.");
+      return;
+    }
     setGameStatus("waiting");
+
+    // 빈 방 목록 스냅샷을 먼저 조회
     const snap = await get(ref(db, "rooms"));
-    let joined = false;
+    let joinedRoomId: string | null = null;
+
     if (snap.exists()) {
       const rooms = snap.val();
-      for (const key in rooms) {
-        if (
+      // 조건에 맞는 대기 방 키를 모두 수집
+      const candidateKeys = Object.keys(rooms).filter(
+        (key) =>
           rooms[key].status === "waiting" &&
+          rooms[key].p1 !== userId &&        // 내가 만든 방 제외
           rooms[key].mode?.elements === useElements &&
           rooms[key].mode?.ions     === useIons
-        ) {
+      );
+
+      // 트랜잭션으로 첫 번째 빈 방에 입장 시도 (동시 접근 방지)
+      for (const key of candidateKeys) {
+        const roomRef = ref(db, `rooms/${key}`);
+        let success = false;
+
+        await runTransaction(roomRef, (current) => {
+          // 트랜잭션 도중 방 상태 재확인
+          if (!current || current.status !== "waiting" || current.p2) {
+            return; // abort → 다른 방 시도
+          }
+
+          // 카드 생성
           let selectedPairs: any[] = [];
           if (useElements && !useIons)
             selectedPairs = [...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 10);
@@ -494,6 +534,7 @@ export default function Home() {
               ...[...CHEMICAL_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
               ...[...ION_POOL].sort(() => Math.random() - 0.5).slice(0, 5),
             ];
+
           const rawData: any[] = [];
           selectedPairs.forEach((elem) => {
             rawData.push({ pairId: elem.id, content: elem.symbol, isFlipped: false, matchedBy: null });
@@ -501,26 +542,48 @@ export default function Home() {
           });
           rawData.sort(() => Math.random() - 0.5);
           const shuffledBoard = rawData.map((card, idx) => ({ ...card, id: idx }));
-          await update(ref(db, `rooms/${key}`), {
-            p2: userId, status: "rps", board: shuffledBoard,
-            scores: { p1: 0, p2: 0 }, comboCount: 0,
-            p1_rps: null, p2_rps: null, p1_online: true, p2_online: true,
-          });
-          localStorage.setItem("element_game_room_id", key);
-          setRoomId(key); setPlayerRole("p2"); joined = true; break;
+
+          return {
+            ...current,
+            p2:        userId,
+            status:    "rps",
+            board:     shuffledBoard,
+            scores:    { p1: 0, p2: 0 },
+            comboCount: 0,
+            p1_rps:    null,
+            p2_rps:    null,
+            p1_online: true,
+            p2_online: true,
+          };
+        }).then((result) => {
+          if (result.committed) success = true;
+        }).catch(() => {});
+
+        if (success) {
+          joinedRoomId = key;
+          break;
         }
       }
     }
-    if (!joined) {
-      const newRoomId  = `room_${Date.now()}`;
+
+    if (joinedRoomId) {
+      localStorage.setItem("element_game_room_id", joinedRoomId);
+      setRoomId(joinedRoomId);
+      setPlayerRole("p2");
+    } else {
+      // 빈 방 없음 → 새 방 생성
+      const newRoomId  = `room_${Date.now()}_${userId}`;
       const newRoomRef = ref(db, `rooms/${newRoomId}`);
       await set(newRoomRef, {
-        p1: userId, status: "waiting",
-        mode: { elements: useElements, ions: useIons }, p1_online: true,
+        p1:     userId,
+        status: "waiting",
+        mode:   { elements: useElements, ions: useIons },
+        p1_online: true,
       });
       localStorage.setItem("element_game_room_id", newRoomId);
       onDisconnect(newRoomRef).remove();
-      setRoomId(newRoomId); setPlayerRole("p1");
+      setRoomId(newRoomId);
+      setPlayerRole("p1");
     }
   };
 
@@ -529,10 +592,40 @@ export default function Home() {
     setIsLocked(true);
     try {
       const roomRef = ref(db, `rooms/${roomId}`);
-      await onDisconnect(roomRef).cancel(); await remove(roomRef);
+      await onDisconnect(roomRef).cancel();
+      await remove(roomRef);
       localStorage.removeItem("element_game_room_id");
       setRoomId(""); setPlayerRole(null); setGameStatus("lobby");
     } catch (e) { console.error(e); } finally { setIsLocked(false); }
+  };
+
+  // ── ✅ 수정 3: 가위바위보 나가기 (로비로 복귀) ──────────────
+  const leaveRps = async () => {
+    if (!confirm("가위바위보를 포기하고 로비로 돌아가시겠습니까?")) return;
+    if (roomId) {
+      try {
+        // 상대방이 이미 있으면 상대 자동 승리 처리, 없으면 방 삭제
+        const snap = await get(ref(db, `rooms/${roomId}`));
+        if (snap.exists()) {
+          const room = snap.val();
+          const opRole = playerRole === "p1" ? "p2" : "p1";
+          if (room[opRole]) {
+            // 상대방 있음 → 포기 처리
+            await update(ref(db, `rooms/${roomId}`), {
+              scores:       { [playerRole!]: 0, [opRole]: 10 },
+              status:       "finished",
+              forfeitWinner: opRole,
+            });
+          } else {
+            // 방에 나만 있음 → 방 삭제
+            await remove(ref(db, `rooms/${roomId}`));
+          }
+        }
+      } catch (e) { console.error(e); }
+    }
+    localStorage.removeItem("element_game_room_id");
+    setRoomId(""); setPlayerRole(null); setRoomData(null);
+    setGameStatus("lobby");
   };
 
   // ── 핸들러: 게임 중 포기 ────────────────────────────────────
@@ -555,18 +648,16 @@ export default function Home() {
   const handleCardClick = (clickedCard: Card) => {
     if (currentTurn !== playerRole || previewStatus !== "none") return;
     if (isLocked || clickedCard.isFlipped || clickedCard.matchedBy) return;
-    if (showMyTurnNotice) return;   // 알림 중 클릭 차단
+    if (showMyTurnNotice) return;
 
     const newFlipped = [...flippedIndexes, clickedCard.id];
     setFlippedIndexes(newFlipped);
     update(ref(db, `rooms/${roomId}/board/${clickedCard.id}`), { isFlipped: true });
 
-    // 첫 번째 카드 선택 완료 → 두 번째 카드 타이머 시작
     if (newFlipped.length === 1) {
       setFirstCardPicked(true);
-      clearCardTimer(); // 첫 카드 타이머 종료
+      clearCardTimer();
       startCardTimer(() => {
-        // 두 번째 카드 시간 초과 → 첫 카드 뒤집고 턴 넘김
         update(ref(db, `rooms/${roomId}`), {
           [`board/${clickedCard.id}/isFlipped`]: false,
           currentTurn: playerRole === "p1" ? "p2" : "p1",
@@ -579,7 +670,6 @@ export default function Home() {
       return;
     }
 
-    // 두 번째 카드 선택
     if (newFlipped.length === 2) {
       clearCardTimer();
       setIsLocked(true);
@@ -589,7 +679,6 @@ export default function Home() {
       const card2 = cards[idx2];
 
       if (card1.pairId === card2.pairId) {
-        // 정답!
         setTimeout(() => {
           const newCombo   = comboCount + 1;
           const maxReached = newCombo >= 3;
@@ -613,7 +702,6 @@ export default function Home() {
           setIsLocked(false);
         }, 500);
       } else {
-        // 오답 → 즉시 턴 넘김 (별도 타이머 없음)
         setTimeout(() => {
           update(ref(db, `rooms/${roomId}`), {
             [`board/${idx1}/isFlipped`]: false,
@@ -640,9 +728,10 @@ export default function Home() {
   const leaveRoom = () => {
     scoreAppliedRef.current   = false;
     previewStartedRef.current = false;
+    gameReadyRef.current      = false;
     prevTurnRef.current       = null;
     clearCardTimer();
-    if (disconnectTimerRef.current)   clearTimeout(disconnectTimerRef.current);
+    if (disconnectTimerRef.current)    clearTimeout(disconnectTimerRef.current);
     if (disconnectIntervalRef.current) clearInterval(disconnectIntervalRef.current);
     localStorage.removeItem("element_game_room_id");
     setGameStatus("lobby");
@@ -775,7 +864,6 @@ export default function Home() {
       )}
 
       {/* ── 4. 로비 ── */}
-      {/* 4️⃣ 로비 화면 (중앙 정렬 및 랭킹 팝업 적용) */}
       {gameStatus === "lobby" && (
         <>
           <div className="bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border-t-8 border-blue-600">
@@ -785,7 +873,7 @@ export default function Home() {
             <div className="text-center mt-2">
               <h1 className="text-4xl font-black mb-2 text-slate-800">🧪 원소 기호 대전</h1>
               <p className="text-gray-400 mb-6">연구원 정보: <span className="text-slate-700 font-bold">{nickname} ({userId})</span></p>
-              
+
               <div className="bg-slate-50 p-4 rounded-xl mb-4 border border-gray-200 text-black text-left">
                 <div className="text-xs font-bold text-gray-400 mb-2">게임 출제 범위 설정</div>
                 <div className="flex flex-col sm:flex-row gap-4 justify-center py-2">
@@ -805,7 +893,7 @@ export default function Home() {
                 <div className="text-4xl font-black text-blue-600">{myTotalScore}점</div>
               </div>
             </div>
-            
+
             <div className="flex gap-3">
               <button onClick={() => setShowRanking(true)} className="flex-[1] py-4 bg-amber-500 text-white text-lg font-bold rounded-xl hover:bg-amber-600 shadow-md transition-all">
                 🏆 랭킹
@@ -816,7 +904,7 @@ export default function Home() {
             </div>
           </div>
 
-          {/* 🏆 랭킹 팝업창 */}
+          {/* 🏆 랭킹 팝업 */}
           {showRanking && (
             <div className="fixed inset-0 bg-black/60 z-50 flex flex-col items-center justify-center p-4">
               <div className="bg-white w-full max-w-sm rounded-2xl shadow-2xl flex flex-col max-h-[80vh] border-t-8 border-amber-500 overflow-hidden">
@@ -898,19 +986,25 @@ export default function Home() {
             <div className="text-2xl font-bold text-red-500 mb-4 animate-bounce">무승부! 다시 선택하세요!</div>
           )}
           {!roomData?.[`${playerRole}_rps`] && (
-            <div className="flex justify-center gap-4">
+            <div className="flex justify-center gap-4 mb-8">
               <button onClick={() => handleRpsSelect("scissors")} className="text-5xl hover:scale-110 bg-gray-100 p-4 rounded-xl">✌️</button>
               <button onClick={() => handleRpsSelect("rock")}     className="text-5xl hover:scale-110 bg-gray-100 p-4 rounded-xl">✊</button>
               <button onClick={() => handleRpsSelect("paper")}    className="text-5xl hover:scale-110 bg-gray-100 p-4 rounded-xl">🖐️</button>
             </div>
           )}
+          {/* ✅ 수정 3: 가위바위보 나가기 버튼 */}
+          <div className="border-t pt-6">
+            <button onClick={leaveRps}
+              className="px-6 py-2.5 bg-red-500 hover:bg-red-600 text-white font-bold rounded-xl shadow-sm transition-colors text-sm">
+              🚪 포기하고 로비로 돌아가기
+            </button>
+          </div>
         </div>
       )}
 
       {/* ── 7. 본 게임 ── */}
       {gameStatus === "playing" && (
         <>
-          {/* 암기 카운트다운 */}
           {previewStatus === "countdown" && (
             <div className="fixed inset-0 bg-black/70 z-50 flex flex-col items-center justify-center text-white">
               <div className="text-8xl font-black mb-4 tracking-wider text-amber-400 animate-ping">{countdownText}</div>
@@ -923,15 +1017,14 @@ export default function Home() {
             </div>
           )}
 
-          {/* 상대방 이탈 알림 */}
           {opponentDisconnected && (
             <div className="fixed top-0 left-0 right-0 bg-red-500 text-white text-center py-3 font-black text-lg z-50 shadow-md">
               ⚠️ 상대방 연결 끊김! {disconnectCountdown}초 안에 돌아오지 않으면 자동 승리 처리됩니다.
             </div>
           )}
 
-          {/* ★ "내 차례!" 전면 알림 */}
-          {showMyTurnNotice && (
+          {/* ✅ 수정 4: "내 차례!" — previewStatus 조건 추가로 이중 차단 */}
+          {showMyTurnNotice && previewStatus === "none" && (
             <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center pointer-events-none">
               <div className="bg-green-500 text-white px-16 py-10 rounded-3xl shadow-2xl text-center animate-bounce">
                 <div className="text-6xl mb-3">🔔</div>
@@ -940,7 +1033,6 @@ export default function Home() {
             </div>
           )}
 
-          {/* ★ 연속 3회 최대 달성 알림 */}
           {showMaxComboNotice && (
             <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center pointer-events-none">
               <div className="bg-gradient-to-br from-orange-400 to-red-500 text-white px-12 py-8 rounded-3xl shadow-2xl text-center">
@@ -960,14 +1052,12 @@ export default function Home() {
                 {currentTurn === playerRole ? "🔔 내 턴!" : "💤 상대방 턴"}
               </div>
               <div className="text-xs text-gray-500 font-bold">🔥 연속: {comboCount}/3</div>
-              {/* ★ 카드 타이머 표시 */}
               {currentTurn === playerRole && cardTimerSec > 0 && !showMyTurnNotice && (
                 <div className={`text-3xl font-black tabular-nums transition-colors
                   ${cardTimerSec <= 2 ? "text-red-500 animate-pulse" : "text-blue-500"}`}>
                   {cardTimerSec}
                 </div>
               )}
-              {/* 포기 버튼 */}
               <button onClick={handleForfeit}
                 className="mt-1 px-3 py-1 bg-red-500 hover:bg-red-600 text-white text-xs font-bold rounded-lg shadow transition-colors">
                 🚪 포기하고 나가기
